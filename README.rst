@@ -10,6 +10,9 @@ DEYE-controller
     - deye-scan is a scanner for dataloggers in the local network (not DEYE related)
     - deye-regwrite - for writing to individual registers
 
+* Monkey patching:
+    - direct value assignment on read for the Register and RegistersGroup types (see the examples dir)
+
 * Tested with:
     - SUN-12K-SG04LP3 / LSW-3
 
@@ -23,10 +26,11 @@ INSTALL
 
 TODO List
 =============
-
+* Support single phase inverters, eventually with auto detection.
 
 Examples
 ==============
+* After version 0.2.0 PySolarmanV5 can be patched for even easier reading `see here <examples/README_PATCH.rst>`_
 * Basic usage:
 
     * read a register from the inverter

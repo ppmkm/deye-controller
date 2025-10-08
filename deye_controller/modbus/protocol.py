@@ -1,7 +1,8 @@
 """
 MODBUS Registers for DEYE 12K Inverters
 """
-from abc import abstractmethod, ABCMeta
+
+from abc import abstractmethod
 from textwrap import wrap
 import enum
 import struct
@@ -32,10 +33,68 @@ class Register(object):
         self.len = length
         self.description = description
         self.value = None
+        self.suffix = ''
 
     @abstractmethod
     def format(self):
         pass
+
+    def format_custom(self, scaling: float, prefix: str = '') -> float:
+        """
+        Custom format
+
+        :param scaling: Scaling applied to the register value
+        :param prefix: Extra prefix (will be added to the suffix permanently on first use)
+        :return:
+        """
+        self.suffix = prefix + self.suffix
+
+        return round(self.format() / scaling, 3)
+
+
+class RegisterNC(object):
+    """
+    Non-contiguous register. Found in more powerful Deye models (35/50kW)
+    """
+    def __init__(self, address1, address2, description=''):
+        self.address1 = address1
+        self.address2 = address2
+        self.len = 1
+        self.description = description
+        #self.value = None
+        self.val1 = 0
+        self.val2 = 0
+        self.suffix = ''
+        self._head_set = False
+
+    @abstractmethod
+    def format(self):
+        pass
+
+    @property
+    def value(self) -> List[int]:
+        return [self.val1, self.val2]
+
+    @value.setter
+    def value(self, x: int):
+        if self._head_set ^ True:
+            self.val1 = x
+            self._head_set ^= True
+        else:
+            self.val2 = x
+            self._head_set ^= True
+
+    def format_custom(self, scaling: float, prefix: str = '') -> float:
+        """
+        Custom format
+
+        :param scaling: Scaling applied to the register value
+        :param prefix: Extra prefix (will be added to the suffix permanently on first use)
+        :return:
+        """
+        self.suffix = prefix + self.suffix
+
+        return round(self.format() / scaling, 3)
 
 
 class IntType(Register):
@@ -103,6 +162,37 @@ class LongUnsignedType(Register):
 
     def format(self):
         v = to_unsigned_bytes(self.value[::-1])
+        calculated = int.from_bytes(v, byteorder='big')
+        if self.scale == 1:
+            return calculated
+        else:
+            return round(calculated / self.scale, 2)
+
+
+class LongUnsignedNCType(RegisterNC):
+
+    def __init__(self, address1, address2, name, scale, suffix=''):
+        super(LongUnsignedNCType, self).__init__(address1, address2, name)
+        self.scale = scale
+        self.suffix = suffix
+
+    def format(self):
+        v = to_unsigned_bytes(self.value[::-1])
+        calculated = int.from_bytes(v, byteorder='big')
+        if self.scale == 1:
+            return calculated
+        else:
+            return round(calculated / self.scale, 2)
+
+
+class LongNCType(RegisterNC):
+    def __init__(self, address1, address2, name, scale, suffix=''):
+        super(LongNCType, self).__init__(address1, address2, name)
+        self.scale = scale
+        self.suffix = suffix
+
+    def format(self):
+        v = to_bytes(self.value[::-1])
         calculated = int.from_bytes(v, byteorder='big')
         if self.scale == 1:
             return calculated
@@ -271,6 +361,103 @@ class MicroinverterExportCutoff(Register):
                 }
 
 
+class TempWithOffset(FloatType):
+
+    def __init__(self, address, name, scale=10, offset=1000):
+        super().__init__(address, name, scale, suffix='°C')
+        self.offset = offset
+
+    def format(self) -> float:
+        return round(super().format() - self.offset / self.scale, 2)
+
+
+class ACRelayStatus(Register):
+    
+    def __init__(self):
+        super().__init__(552, 1, 'ac_relays')
+
+    def format(self):
+        as_bits = [int(x) for x in f'{self.value:016b}'[::-1]]
+        inverter_relay = BitOnOff(as_bits[0])
+        grid_relay = BitOnOff(as_bits[2])
+        gen_relay = BitOnOff(as_bits[3])
+        grid_power_relay = BitOnOff(as_bits[4])  # No idea what is this - grid give power to relay
+        dry_contact_1 = BitOnOff(as_bits[7])
+        dry_contact_2 = BitOnOff(as_bits[8])
+
+        return {
+            'Inverter':  inverter_relay,
+            'Grid': grid_relay,
+            'Generator': gen_relay,
+            'GridPower': grid_power_relay,
+            'DryContact-1': dry_contact_1,
+            'DryContact-2': dry_contact_2,
+        }
+
+
+class WarningOne(Register):
+    def __init__(self):
+        super().__init__(553, 1, 'warn_1')
+
+    def format(self):
+        as_bits = [int(x) for x in f'{self.value:016b}'[::-1]]
+        fan_warn = BitOnOff(as_bits[1])
+        wrong_phase = BitOnOff(as_bits[2])
+
+        return {
+            'Fan-Warning': fan_warn,
+            'Wrong-Phase': wrong_phase
+        }
+
+
+class WarningTwo(Register):
+    def __init__(self):
+        super().__init__(554, 1, 'warn_2')
+
+    def format(self):
+        as_bits = [int(x) for x in f'{self.value:016b}'[::-1]]
+        bms_comm = BitOnOff(as_bits[14])
+        parallel_com = BitOnOff(as_bits[15])
+
+        return {
+            'BMS-COMM-Lost': bms_comm,
+            'Parallel-COMM-Lost': parallel_com
+        }
+
+class FaultInformation(Register):
+
+    def __init__(self):
+        super().__init__(555, 4, 'fault_information')
+
+    def format(self):
+        e_code = struct.unpack('>I', bytearray(self.value))
+        fault = DeyeHybridFaultInfo(e_code[0])
+
+        error = f'{fault.name}: {fault_map_hybrid.get(fault, "Undocumented")}'
+        if fault == DeyeHybridFaultInfo.F99:
+            error += f' [{e_code[0]}]'
+
+        return error
+
+
+
+class GenPortUse(Register):
+
+    def __init__(self):
+        super().__init__(133, 1, 'gen_port_use')
+
+    def format(self):
+        return str(GenPortMode(self.value))
+
+
+class InverterWorkMode(Register):
+    def __init__(self):
+        super().__init__(142, 1, 'work_mode')
+
+    def format(self):
+        return str(WorkMode(self.value))
+
+
 class HoldingRegisters:
 
     DeviceType = DeviceType()
@@ -304,11 +491,22 @@ class HoldingRegisters:
     BattRestartVoltage = FloatType(119, 'battery_restart_voltage', 100, suffix='V')
     BattLowVoltage = FloatType(120, 'battery_low_voltage', 100, suffix='V')
 
+    """ Generator settings """
+    GeneratorWorkingTime = FloatType(121, 'gen_max_working_time', 10, suffix='h')
+    GeneratorCoolingTime = FloatType(122, 'gen_cooling_time', 10, suffix='h')
+    GeneratorStartVoltage = FloatType(123, 'gen_charge_start_voltage', 100, suffix='V')
+    GeneratorStartCapacity = FloatType(124, 'gen_charge_start_soc', 100, suffix='%')
+    GeneratorChargeCurrent = IntType(125, 'gen_charge_current', suffix='A')
+
     """ Generator settings up to register 125 """
     GridChargeStartVolts = FloatType(126, 'grid_charge_start_voltage', 100, suffix='V')
     GridChargeStartCapacity = IntType(127, 'grid_charge_start_soc', suffix='%')
     GridChargeCurrent = IntType(128, 'grid_charge_current', suffix='A')
 
+    """ Smart Load control - need more info  """
+    GeneratorPortSetup = GenPortUse()
+    """ Smart Load """
+    InverterWorkMode = InverterWorkMode()
     GridExportLimit = IntType(143, 'grid_max_output_pwr', suffix='W')
     SolarSell = BoolType(145, 'solar_sell')
     SellTimeOfUse = TimeOfUseSell()
@@ -406,8 +604,23 @@ class HoldingRegisters:
     TodayFromPV = FloatType(529, 'today_from_pv', 10, suffix='kWh')
     TodayFromPVString1 = FloatType(530, 'today_from_pv_s1', 10, suffix='kWh')
     TodayFromPVString2 = FloatType(531, 'today_from_pv_s2', 10, suffix='kWh')
+    TodayFromPVString3 = FloatType(532, 'today_from_pv_s3', 10, suffix='kWh')
+    TodayFromPVString4 = FloatType(533, 'today_from_pv_s4', 10, suffix='kWh')
     TotalFromPV = LongUnsignedType(534, 'total_from_pv', 10, suffix='kWh')
+    TodayFromGenerator = FloatType(536, 'today_from_generator', 10, suffix='kWh')
+    TotalFromGenerator = LongUnsignedType(537, 'total_from_generator', 10, suffix='kWh')
+    TodayGeneratorWorkTime = FloatType(539, 'generator_worktime_today', 10, suffix='hours')
 
+    DCTransformerTemp = TempWithOffset(540, 'dc_transformer_temp')
+    HeatsinkTemp = TempWithOffset(541, 'heatsink_temp')
+
+    LoadAnnualConsumption = LongUnsignedType(545, 'load_annual_consumption', 10, suffix='kWh')
+
+    ACRelays = ACRelayStatus()
+    """ WARNINGS """
+    Warning_1 = WarningOne()
+    Warning_2 = WarningTwo()
+    Fault = FaultInformation()
     BatteryTemp = FloatType(586, 'battery_temperature', 100, suffix='°C')
     BatteryVoltage = FloatType(587, 'battery_voltage', 100, suffix='V')
     BatterySOC = FloatType(588, 'battery_soc', 1, suffix='%')
@@ -480,13 +693,28 @@ class HoldingRegisters:
     LoadPhaseCPower = IntType(652, 'load_phase_C_power', suffix='W', signed=True)
     LoadTotalPower = IntType(653, 'load_total_power', suffix='W', signed=True)
     """ GENERATOR skipped """
+
+    GeneratorPhaseAVoltage = FloatType(661, 'gen_phase_A_volt', 10, suffix='V')
+    GeneratorPhaseBVoltage = FloatType(662, 'gen_phase_B_volt', 10, suffix='V')
+    GeneratorPhaseCVoltage = FloatType(663, 'gen_phase_C_volt', 10, suffix='V')
+    GeneratorPhaseAPower = IntType(664, 'gen_phase_A_power', suffix='W', signed=True)
+    GeneratorPhaseBPower = IntType(665, 'gen_phase_B_power', suffix='W', signed=True)
+    GeneratorPhaseCPower = IntType(666, 'gen_phase_C_power', suffix='W', signed=True)
+    GeneratorTotalPower = IntType(667, 'gen_total_power', suffix='W', signed=True)
+
     """ PV Inputs """
     PV1InPower = IntType(672, 'pv1_in_power', suffix='W')
     PV2InPower = IntType(673, 'pv2_in_power', suffix='W')
+    PV3InPower = IntType(674, 'pv3_in_power', suffix='W')
+    PV4InPower = IntType(675, 'pv4_in_power', suffix='W')
     PV1Voltage = FloatType(676, 'pv1_volt', 10, suffix='V')
     PV1Current = FloatType(677, 'pv1_current', 10, suffix='A')
     PV2Voltage = FloatType(678, 'pv2_volt', 10, suffix='V')
     PV2Current = FloatType(679, 'pv2_current', 10, suffix='A')
+    PV3Voltage = FloatType(680, 'pv3_volt', 10, suffix='V')
+    PV3Current = FloatType(681, 'pv3_current', 10, suffix='A')
+    PV4Voltage = FloatType(682, 'pv4_volt', 10, suffix='V')
+    PV4Current = FloatType(683, 'pv4_current', 10, suffix='A')
 
     @staticmethod
     def as_list() -> List[Register]:
@@ -674,6 +902,41 @@ class BoolWritable(WritableRegister):
         self.value = x
 
 
+class GenPortUseWritable(WritableRegister):
+    """
+    Generator port settings.
+
+    Example:
+        >>> from deye_controller.modbus.protocol import GenPortUseWritable
+        >>> from deye_controller.modbus.enums import GenPortMode
+        >>> v = GenPortUseWritable()
+        >>> v.set(GenPortMode.MicroInverter)
+        or directly as int
+        >>> v.set(2)
+
+        when used from the WritableRegisters class
+
+        >>> from deye_controller.modbus.protocol import GenPortMode
+        >>> from deye_controller.modbus.protocol import WritableRegisters
+        >>> wr = WritableRegisters()
+        >>> wr.GenPortUse.set(GenPortMode.MicroInverter)
+    """
+
+    def __init__(self):
+        super().__init__(133)
+
+    def set(self, x: Union[int, GenPortMode]):
+        if not isinstance(x, GenPortMode):
+            if x > GenPortMode.MicroInverter \
+                    or x < GenPortMode.GenInput:
+                raise ValueError('Invalid value. Must be between 0 and 2')
+            self.modbus_value = x
+            self.value = GenPortMode(x)
+        else:
+            self.modbus_value = x.value
+            self.value = x
+
+
 class WritableRegisters:
 
     DeviceTime = DeviceTimeWriteable()
@@ -712,7 +975,13 @@ class WritableRegisters:
 
     BatteryVoltsShutDown = FloatWritable(address=118, low_limit=38, high_limit=63, scale=100)
     BatteryVoltsRestart = FloatWritable(address=119, low_limit=38, high_limit=63, scale=100)
-    BatteryVoltsLow = FloatWritable(address=119, low_limit=38, high_limit=63, scale=100)
+    BatteryVoltsLow = FloatWritable(address=120, low_limit=38, high_limit=63, scale=100)
+    """ Generator Settings """
+    GeneratorMaxWorkTime = FloatWritable(address=121, low_limit=0, high_limit=23, scale=10)
+    GeneratorCoolingTime = FloatWritable(address=122, low_limit=0, high_limit=23, scale=10)
+    GeneratorStartVoltage = FloatWritable(address=123, low_limit=0, high_limit=63, scale=100)
+    GeneratorStartCapacity = FloatWritable(address=124, low_limit=0, high_limit=63, scale=100)
+    GeneratorChargeCurrent = IntWritable(address=125, low_limit=0, high_limit=185)
 
     GridChargeStartVoltage = FloatWritable(address=126, low_limit=38, high_limit=61, scale=100)
     GridChargeStartCapacity = IntWritable(address=127, low_limit=0, high_limit=100)
@@ -720,11 +989,13 @@ class WritableRegisters:
     GridChargeBattCurrent = IntWritable(address=128, low_limit=0, high_limit=185)
 
     """ Smart load options """
+    GenPortUse = GenPortUseWritable()
     SmartLoadOffVoltage = FloatWritable(address=134, low_limit=38, high_limit=63, scale=100)
     SmartLoadOffCapacity = IntWritable(address=135, low_limit=0, high_limit=100)
     SmartLoadOnVoltage = FloatWritable(address=136, low_limit=38, high_limit=63, scale=100)
     SmartLoadOnCapacity = IntWritable(address=137, low_limit=0, high_limit=100)
 
+    InverterWorkMode = IntWritable(address=142, low_limit=0, high_limit=2)
     GridExportLimit = IntWritable(address=143, low_limit=0, high_limit=15000)
     SolarSell = BoolWritable(address=145)
 
